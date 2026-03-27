@@ -10,7 +10,7 @@ const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const MONITOR_INTERVAL = 2500; // 2.5 seconds
 
 const RPC_LIST = [
-  { label: 'Helius', url: 'https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}' },
+  { label: 'Helius', url: 'https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY' },
   { label: 'Solana Public', url: 'https://api.mainnet-beta.solana.com' },
   { label: 'Helius Pump', url: 'https://pump.helius-rpc.com/' },
 ];
@@ -19,8 +19,8 @@ const DEFAULT_PRESETS = {
   sannastrat: { name: 'sannastrat', sol: 0.1, range: 35, strategy: 'spot' },
 };
 
-// TELEGRAM_TOKEN loaded after loadEnvFile() below
-
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const DATA_FILE = './data.json';
 
 function loadData() {
@@ -49,8 +49,6 @@ function loadEnvFile() {
   } catch { }
 }
 loadEnvFile();
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
 function saveEnvFile() {
   const lines = Object.entries(process.env)
@@ -212,26 +210,29 @@ async function withdrawAndReaddToTargetBin(poolAddress, positionKey, targetBinId
   });
   const txList = Array.isArray(removeTx) ? removeTx : [removeTx];
   await Promise.all(txList.map(tx =>
-    sendAndConfirmTransaction(connection, tx, [wallet], { skipPreflight: false, commitment: 'confirmed' })
+    sendAndConfirmTransaction(connection, tx, [wallet], { skipPreflight: true, commitment: 'processed' })
   ));
 
-  // Wait for balance to settle on-chain
-  await new Promise(r => setTimeout(r, 3000));
-
-  // Step 2: Get token balance with retry
-  const { getAssociatedTokenAddress, getAccount } = require('@solana/spl-token');
-  const tokenAccount = await getAssociatedTokenAddress(new PublicKey(tokenMint), wallet.publicKey);
+  // Step 2: Fast retry every 500ms up to 10 seconds
   let tokenBalance = new BN(0);
-  for (let i = 0; i < 3; i++) {
+  const _deadline = Date.now() + 10000;
+  while (Date.now() < _deadline) {
     try {
-      const account = await getAccount(connection, tokenAccount, 'confirmed');
-      tokenBalance = new BN(account.amount.toString());
-      if (!tokenBalance.isZero()) break;
-    } catch { }
-    await new Promise(r => setTimeout(r, 2000));
+      const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+        wallet.publicKey,
+        { mint: new PublicKey(tokenMint) },
+        'processed'
+      );
+      if (tokenAccounts.value.length > 0) {
+        const amt = tokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount;
+        tokenBalance = new BN(amt);
+        if (tokenBalance.gtn(0)) break;
+      }
+    } catch (e) { }
+    await new Promise(r => setTimeout(r, 500));
   }
 
-  if (tokenBalance.isZero()) {
+  if (tokenBalance.eqn(0)) {
     console.log('[Extreme] No token balance after withdraw, skipping readd');
     return 'no_token';
   }
@@ -246,7 +247,7 @@ async function withdrawAndReaddToTargetBin(poolAddress, positionKey, targetBinId
     strategy: { minBinId: targetBinId, maxBinId: targetBinId, strategyType: StrategyType.BidAsk },
   });
 
-  const addHash = await sendAndConfirmTransaction(connection, addTx, [wallet], { skipPreflight: false, commitment: 'confirmed' });
+  const addHash = await sendAndConfirmTransaction(connection, addTx, [wallet], { skipPreflight: true, commitment: 'processed' });
   return addHash;
 }
 
@@ -284,6 +285,38 @@ async function closeAndReopenPosition(poolAddress, positionKey, solAmount) {
 
 // ─── Extreme Monitor Loop ─────────────────────────────────────
 
+
+async function closeExtremePositionOnly(poolAddress, positionKey) {
+  const wallet = getActiveWallet();
+  if (!wallet) throw new Error('Tidak ada wallet aktif');
+  const dlmmPool = await DLMM.create(connection, new PublicKey(poolAddress));
+  await dlmmPool.refetchStates();
+  const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey);
+  const userPos = userPositions.find(p => p.publicKey.toBase58() === positionKey);
+  if (!userPos) return [];
+  const binIds = userPos.positionData.positionBinData.map(b => b.binId);
+  if (binIds.length > 0) {
+    const removeTx = await dlmmPool.removeLiquidity({
+      position: new PublicKey(positionKey),
+      user: wallet.publicKey,
+      fromBinId: binIds[0],
+      toBinId: binIds[binIds.length - 1],
+      bps: new BN(10000),
+      shouldClaimAndClose: true,
+    });
+    const txList = Array.isArray(removeTx) ? removeTx : [removeTx];
+    return await Promise.all(txList.map(tx =>
+      sendAndConfirmTransaction(connection, tx, [wallet], { skipPreflight: true, commitment: 'processed' })
+    ));
+  } else {
+    try {
+      const closeTx = await dlmmPool.closePosition({ owner: wallet.publicKey, position: userPos });
+      const hash = await sendAndConfirmTransaction(connection, closeTx, [wallet], { skipPreflight: true, commitment: 'processed' });
+      return [hash];
+    } catch(e) { return []; }
+  }
+}
+
 async function extremeMonitorTick(chatId) {
   const session = extremeSessions[chatId];
   if (!session || session.status === 'stopped') return;
@@ -293,8 +326,32 @@ async function extremeMonitorTick(chatId) {
     const currentBinId = activeBin.binId;
 
     if (session.status === 'active') {
+      // OOR kanan → close + reopen di bin baru langsung
+      if (currentBinId > session.targetBinId) {
+        session.cycleCount = (session.cycleCount || 0) + 1;
+        session.status = 'executing';
+        await tgSend(chatId, '➡️ OOR kanan! Bin: ' + currentBinId + ' > ' + session.targetBinId + ' (Cycle #' + session.cycleCount + ') - Closing...');
+        await closeExtremePositionOnly(session.poolAddress, session.positionKey);
+        await new Promise(r => setTimeout(r, 3000));
+        const walletR = getActiveWallet();
+        const balR = await getSolBalance(walletR.publicKey.toBase58());
+        const solR = parseFloat((Math.max(0, balR - 0.08)).toFixed(4));
+        if (solR < 0.01) {
+          session.status = 'stopped';
+          await tgSend(chatId, '⚠️ SOL habis. Extreme mode dihentikan.');
+          return;
+        }
+        const resultR = await openExtremePosition(session.poolAddress, solR);
+        session.positionKey = resultR.positionKey;
+        session.targetBinId = resultR.targetBinId;
+        session.status = 'active';
+        await tgSend(chatId,
+          '✅ Cycle #' + session.cycleCount + ' (kanan) SOL: ' + solR + ' New bin: ' + resultR.targetBinId,
+          { inline_keyboard: [[{ text: '🛑 Stop Extreme', callback_data: 'extreme:stop:' + chatId }]] }
+        );
+      }
       // OOR kiri → withdraw + readd token ke bin yang sama, tunggu harga balik
-      if (currentBinId < session.targetBinId) {
+      else if (currentBinId < session.targetBinId) {
         session.status = 'oor';
         await tgSend(chatId,
           `⚠️ EXTREME: Out of Range!\n🎯 Target bin: ${session.targetBinId}\n📍 Current bin: ${currentBinId}\n\n⏳ Withdraw & readd token ke bin ${session.targetBinId}...`
@@ -312,22 +369,35 @@ async function extremeMonitorTick(chatId) {
         }
       }
 
+    } else if (session.status === 'executing') {
+      // Skip - currently executing, wait
     } else if (session.status === 'waiting') {
-      // Harga balik ke target bin atau lebih → token konversi ke SOL → close & reopen fresh
+      // Harga balik ke target bin atau lebih → close + reopen fresh
       if (currentBinId >= session.targetBinId) {
         session.cycleCount = (session.cycleCount || 0) + 1;
-        await tgSend(chatId,
-          `🎯 Harga balik ke bin ${session.targetBinId}! (Cycle #${session.cycleCount})\n💰 Token sudah konversi ke SOL\n\n⏳ Close & reopen posisi baru...`
-        );
-
-        const result = await closeAndReopenPosition(session.poolAddress, session.positionKey, session.solAmount);
-        session.positionKey = result.positionKey;
-        session.targetBinId = result.targetBinId;
+        session.status = 'executing';
+        await tgSend(chatId, '🎯 Harga balik! Cycle #' + session.cycleCount + ' - Closing posisi...');
+        // Close position
+        await closeExtremePositionOnly(session.poolAddress, session.positionKey);
+        // Wait for balance to settle
+        await new Promise(r => setTimeout(r, 3000));
+        // Check actual SOL balance
+        const wallet2 = getActiveWallet();
+        const bal2 = await getSolBalance(wallet2.publicKey.toBase58());
+        const solToUse = parseFloat((Math.max(0, bal2 - 0.08)).toFixed(4));
+        if (solToUse < 0.01) {
+          session.status = 'stopped';
+          await tgSend(chatId, '⚠️ SOL habis (' + bal2.toFixed(4) + ' SOL). Extreme mode dihentikan.');
+          return;
+        }
+        // Reopen with actual SOL balance
+        const result2 = await openExtremePosition(session.poolAddress, solToUse);
+        session.positionKey = result2.positionKey;
+        session.targetBinId = result2.targetBinId;
         session.status = 'active';
-
         await tgSend(chatId,
-          `✅ EXTREME Cycle #${session.cycleCount} selesai!\n📍 New position: ${shortKey(result.positionKey)}\n🎯 New target bin: ${result.targetBinId}\n🔗 Tx: ${result.txHash}`,
-          { inline_keyboard: [[{ text: '🛑 Stop Extreme', callback_data: `extreme:stop:${chatId}` }]] }
+          '✅ Cycle #' + session.cycleCount + ' selesai! SOL: ' + solToUse + ' New bin: ' + result2.targetBinId + ' Tx: ' + result2.txHash,
+          { inline_keyboard: [[{ text: '🛑 Stop Extreme', callback_data: 'extreme:stop:' + chatId }]] }
         );
       }
     }
