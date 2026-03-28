@@ -162,6 +162,20 @@ function extractPoolAddress(input) {
   return match ? match[match.length - 1] : null;
 }
 function solToLamports(sol) { return new BN(Math.floor(sol * LAMPORTS_PER_SOL)); }
+async function resolveSolAmount(solInput, walletPubkey) {
+  if (solInput === 'max') {
+    const bal = await getSolBalance(walletPubkey);
+    return parseFloat((Math.max(0, bal - 0.08)).toFixed(4));
+  }
+  if (typeof solInput === 'string' && solInput.endsWith('%')) {
+    const pct = parseFloat(solInput);
+    if (isNaN(pct) || pct <= 0 || pct > 100) throw new Error('Persenan harus antara 1-100%');
+    const bal = await getSolBalance(walletPubkey);
+    const usable = Math.max(0, bal - 0.08);
+    return parseFloat((usable * pct / 100).toFixed(4));
+  }
+  return parseFloat(solInput);
+}
 async function getSolBalance(pubkey) { return (await connection.getBalance(new PublicKey(pubkey))) / LAMPORTS_PER_SOL; }
 function rangeToBins(rangePercent, binStep) { return Math.ceil((rangePercent / 100) / (binStep / 10000)); }
 function parseStrategy(str) {
@@ -174,7 +188,7 @@ function isPoolInput(text) {
   return (text.includes('meteora.ag/dlmm/') || /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(text.trim())) && !text.startsWith('/');
 }
 function shortKey(key) { return key.slice(0, 6) + '...' + key.slice(-4); }
-function solLabel(sol) { return sol === 'max' ? 'MAX SOL' : `${sol} SOL`; }
+function solLabel(sol) { return sol === 'max' ? 'MAX SOL' : (typeof sol === 'string' && sol.endsWith('%')) ? `${sol} balance` : `${sol} SOL`; }
 
 async function getPoolAndActiveBin(poolAddress) {
   const dlmmPool = await DLMM.create(connection, new PublicKey(poolAddress));
@@ -185,11 +199,7 @@ async function getPoolAndActiveBin(poolAddress) {
 async function openExtremePosition(poolAddress, solAmount) {
   const wallet = getActiveWallet();
   if (!wallet) throw new Error('Tidak ada wallet aktif');
-  let finalSol = solAmount;
-  if (solAmount === 'max') {
-    const bal = await getSolBalance(wallet.publicKey.toBase58());
-    finalSol = parseFloat((Math.max(0, bal - 0.08)).toFixed(4));
-  }
+  const finalSol = await resolveSolAmount(solAmount, wallet.publicKey.toBase58());
   if (!finalSol || finalSol < 0.001) throw new Error(`SOL tidak cukup (${finalSol} SOL). Minimal 0.001 SOL + 0.08 untuk fee.`);
   const { dlmmPool, activeBin } = await getPoolAndActiveBin(poolAddress);
   await dlmmPool.refetchStates();
@@ -327,8 +337,7 @@ async function extremeMonitorTick(chatId) {
         await closeExtremePositionOnly(session.poolAddress, session.positionKey);
         await new Promise(r => setTimeout(r, 3000));
         const walletR = getActiveWallet();
-        const balR = await getSolBalance(walletR.publicKey.toBase58());
-        const solR = parseFloat((Math.max(0, balR - 0.08)).toFixed(4));
+        const solR = await resolveSolAmount(session.solAmount, walletR.publicKey.toBase58());
         if (solR < 0.01) { session.status = 'stopped'; await tgSend(chatId, '⚠️ SOL habis. Extreme mode dihentikan.'); return; }
         const resultR = await openExtremePosition(session.poolAddress, solR);
         session.positionKey = resultR.positionKey;
@@ -365,9 +374,8 @@ async function extremeMonitorTick(chatId) {
         await closeExtremePositionOnly(session.poolAddress, session.positionKey);
         await new Promise(r => setTimeout(r, 3000));
         const wallet2 = getActiveWallet();
-        const bal2 = await getSolBalance(wallet2.publicKey.toBase58());
-        const solToUse = parseFloat((Math.max(0, bal2 - 0.08)).toFixed(4));
-        if (solToUse < 0.01) { session.status = 'stopped'; await tgSend(chatId, '⚠️ SOL habis (' + bal2.toFixed(4) + ' SOL). Extreme mode dihentikan.'); return; }
+        const solToUse = await resolveSolAmount(session.solAmount, wallet2.publicKey.toBase58());
+        if (solToUse < 0.01) { session.status = 'stopped'; await tgSend(chatId, '⚠️ SOL habis (' + solToUse.toFixed(4) + ' SOL). Extreme mode dihentikan.'); return; }
         const result2 = await openExtremePosition(session.poolAddress, solToUse);
         session.positionKey = result2.positionKey;
         session.targetBinId = result2.targetBinId;
@@ -395,11 +403,7 @@ function stopExtremeSession(chatId) {
 async function addLiquidity(poolAddress, solAmount, rangePercent, strategyStr) {
   const wallet = getActiveWallet();
   if (!wallet) throw new Error('Tidak ada wallet aktif. Import wallet dulu!');
-  let finalSol = solAmount;
-  if (solAmount === 'max') {
-    const bal = await getSolBalance(wallet.publicKey.toBase58());
-    finalSol = parseFloat((Math.max(0, bal - 0.08)).toFixed(4));
-  }
+  const finalSol = await resolveSolAmount(solAmount, wallet.publicKey.toBase58());
   if (!finalSol || finalSol < 0.001) throw new Error(`SOL tidak cukup (${finalSol} SOL). Minimal 0.001 SOL + 0.08 untuk fee.`);
   const dlmmPool = await DLMM.create(connection, new PublicKey(poolAddress));
   await dlmmPool.refetchStates();
@@ -581,7 +585,7 @@ function walletMenu() {
 function stratMenu() {
   const presets = Object.values(state.presets);
   const buttons = presets.map(p => [{
-    text: `${p.name === state.activePresetId ? '✅ ' : ''}${p.name} (${p.sol === 'max' ? 'MAX' : p.sol + ' SOL'} | -${p.range}% | ${p.strategy})`,
+    text: `${p.name === state.activePresetId ? '✅ ' : ''}${p.name} (${p.sol === 'max' ? 'MAX' : (typeof p.sol === 'string' && p.sol.endsWith('%')) ? p.sol + ' bal' : p.sol + ' SOL'} | -${p.range}% | ${p.strategy})`,
     callback_data: `strat:switch:${p.name}`
   }]);
   buttons.push([{ text: '➕ Tambah Strat', callback_data: 'strat:add' }]);
@@ -647,9 +651,10 @@ async function handleTgMessage(chatId, text, messageId) {
       const parts = line.split(/\s+/);
       if (parts.length < 4) continue;
       const [sname, ssol, srange, sstrat] = parts;
-      const sol = ssol === 'max' ? 'max' : parseFloat(ssol);
+      const sol = ssol === 'max' ? 'max' : ssol.endsWith('%') ? ssol : parseFloat(ssol);
       const range = parseFloat(srange);
-      if ((isNaN(sol) && ssol !== 'max') || isNaN(range)) continue;
+      const solValid = sol === 'max' || (typeof sol === 'string' && sol.endsWith('%')) || (!isNaN(sol) && sol > 0);
+      if (!solValid || isNaN(range)) continue;
       addPreset(sname, sname, sol, range, sstrat);
       added.push(sname);
       lastAdded = sname;
@@ -668,9 +673,10 @@ async function handleTgMessage(chatId, text, messageId) {
     const parts = text.trim().split(/\s+/);
     if (parts.length < 3) return tgSend(chatId, '❌ Format salah! Coba lagi:\n<sol|max> <range%> <spot|curve|bidask>\n\nContoh: max 7 bidask');
     const [ssol, srange, sstrat] = parts;
-    const sol = ssol === 'max' ? 'max' : parseFloat(ssol);
+    const sol = ssol === 'max' ? 'max' : ssol.endsWith('%') ? ssol : parseFloat(ssol);
     const range = parseFloat(srange);
-    if ((isNaN(sol) && ssol !== 'max') || isNaN(range)) return tgSend(chatId, '❌ SOL dan range harus angka! Coba lagi:\n<sol|max> <range%> <spot|curve|bidask>');
+    const solValid = sol === 'max' || (typeof sol === 'string' && sol.endsWith('%')) || (!isNaN(sol) && sol > 0);
+    if (!solValid || isNaN(range)) return tgSend(chatId, '❌ Format SOL salah! Coba lagi:\n<sol|max|50%> <range%> <spot|curve|bidask>');
     clearUserState(chatId);
     addPreset(targetId, targetId, sol, range, sstrat);
     const sm = stratMenu();
@@ -709,7 +715,7 @@ async function handleTgMessage(chatId, text, messageId) {
     const poolAddress = extractPoolAddress(text);
     if (!poolAddress) return tgSend(chatId, '❌ Pool address tidak valid.');
     const preset = getActivePreset();
-    await tgSend(chatId, `⚡ Auto AddLP...\n🏊 Pool: ${shortKey(poolAddress)}\n💰 ${preset.sol === 'max' ? '99% balance' : preset.sol + ' SOL'} | -${preset.range}% | ${preset.strategy}`);
+    await tgSend(chatId, `⚡ Auto AddLP...\n🏊 Pool: ${shortKey(poolAddress)}\n💰 ${solLabel(preset.sol)} | -${preset.range}% | ${preset.strategy}`);
     try {
       const result = await addLiquidity(poolAddress, preset.sol, preset.range, preset.strategy);
       const card = positionCard(result.positionKey, state.positions[result.positionKey], { inRange: true });
@@ -794,12 +800,12 @@ async function handleCallback(callbackQuery) {
       }
       return tgEdit(chatId, msgId,
         `💥 EXTREME MODE\n━━━━━━━━━━━━━━━━━━━━\n\n🎯 1 bin | BidAsk | Auto-rebalance\n⏱️ Monitor: 2.5 detik\n💰 SOL: ${solLabel(preset.sol)}\n\n⚠️ Mode ini agresif! Bot akan terus rebalance selama aktif.\n\nPaste link pool untuk mulai:`,
-        { inline_keyboard: [[{ text: `💰 Pakai ${solLabel(preset.sol)} (preset aktif)`, callback_data: `extreme:start:${preset.sol === 'max' ? 'max' : preset.sol}` }], [{ text: '🔙 Back', callback_data: 'menu:main' }]] }
+        { inline_keyboard: [[{ text: `💰 Pakai ${solLabel(preset.sol)} (preset aktif)`, callback_data: `extreme:start:${encodeURIComponent(preset.sol)}` }], [{ text: '🔙 Back', callback_data: 'menu:main' }]] }
       );
     }
 
     if (ns === 'extreme' && action === 'start') {
-      setUserState(chatId, { step: 'extreme_pool', data: { solAmount: param === 'max' ? 'max' : parseFloat(param) } });
+      const decoded = decodeURIComponent(param); setUserState(chatId, { step: 'extreme_pool', data: { solAmount: decoded === 'max' ? 'max' : decoded.endsWith('%') ? decoded : parseFloat(decoded) } });
       return tgEdit(chatId, msgId, `💥 EXTREME MODE\n━━━━━━━━━━━━━━━━━━━━\n\nPaste link pool Meteora:`, { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu:main' }]] });
     }
     if (ns === 'extreme' && action === 'stop') {
@@ -813,18 +819,18 @@ async function handleCallback(callbackQuery) {
     }
 
     if (ns === 'strat' && action === 'switch') { if (!state.presets[param]) return tgEdit(chatId, msgId, '❌ Preset tidak ditemukan.', { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu:strat' }]] }); switchPreset(param); const p = state.presets[param]; const sm = stratMenu(); return tgEdit(chatId, msgId, `✅ Strat aktif: ${p.name}\n💰 ${solLabel(p.sol)} | -${p.range}% | ${p.strategy}\n\n` + sm.text, sm.markup); }
-    if (ns === 'strat' && action === 'add') { setUserState(chatId, { step: 'strat_name' }); return tgEdit(chatId, msgId, '➕ TAMBAH STRAT\n━━━━━━━━━━━━━━━━━━━━\n\nKetik 1 atau beberapa strat (1 per baris):\n<nama> <sol|max> <range%> <spot|curve|bidask>\n\nContoh:\nSETORAN max 7 bidask\nSAFE 1 30 spot', { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu:strat' }]] }); }
+    if (ns === 'strat' && action === 'add') { setUserState(chatId, { step: 'strat_name' }); return tgEdit(chatId, msgId, '➕ TAMBAH STRAT\n━━━━━━━━━━━━━━━━━━━━\n\nKetik 1 atau beberapa strat (1 per baris):\n<nama> <sol|max|50%> <range%> <spot|curve|bidask>\n\nContoh:\nSETORAN max 7 bidask\nSAFE 1 30 spot\nSCALP 50% 5 bidask', { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu:strat' }]] }); }
     if (ns === 'strat' && action === 'edit_list') {
       const presets = Object.values(state.presets);
-      const buttons = presets.map(p => [{ text: `✏️ ${p.name} (${p.sol === 'max' ? 'MAX' : p.sol + ' SOL'} | -${p.range}% | ${p.strategy})`, callback_data: `strat:edit:${p.name}` }]);
+      const buttons = presets.map(p => [{ text: `✏️ ${p.name} (${p.sol === 'max' ? 'MAX' : (typeof p.sol === 'string' && p.sol.endsWith('%')) ? p.sol + ' bal' : p.sol + ' SOL'} | -${p.range}% | ${p.strategy})`, callback_data: `strat:edit:${p.name}` }]);
       buttons.push([{ text: '🔙 Back', callback_data: 'menu:strat' }]);
       return tgEdit(chatId, msgId, '✏️ EDIT STRAT\n━━━━━━━━━━━━━━━━━━━━\n\nPilih strat yang mau diedit:', { inline_keyboard: buttons });
     }
-    if (ns === 'strat' && action === 'edit') { const p = state.presets[param]; if (!p) return tgEdit(chatId, msgId, '❌ Preset tidak ditemukan.', { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu:strat' }]] }); setUserState(chatId, { step: 'strat_edit', data: { id: param } }); return tgEdit(chatId, msgId, `✏️ Edit strat "${param}"\nSekarang: ${solLabel(p.sol)} | -${p.range}% | ${p.strategy}\n\nKetik nilai baru:\n<sol|max> <range%> <spot|curve|bidask>`, { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'strat:edit_list' }]] }); }
+    if (ns === 'strat' && action === 'edit') { const p = state.presets[param]; if (!p) return tgEdit(chatId, msgId, '❌ Preset tidak ditemukan.', { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu:strat' }]] }); setUserState(chatId, { step: 'strat_edit', data: { id: param } }); return tgEdit(chatId, msgId, `✏️ Edit strat "${param}"\nSekarang: ${solLabel(p.sol)} | -${p.range}% | ${p.strategy}\n\nKetik nilai baru:\n<sol|max|50%> <range%> <spot|curve|bidask>`, { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'strat:edit_list' }]] }); }
     if (ns === 'strat' && action === 'delete_list') {
       const presets = Object.values(state.presets);
       if (presets.length === 0) return tgEdit(chatId, msgId, '❌ Tidak ada strat yang bisa dihapus.', { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu:strat' }]] });
-      const buttons = presets.map(p => [{ text: `🗑️ ${p.name} (${p.sol === 'max' ? 'MAX' : p.sol + ' SOL'} | -${p.range}% | ${p.strategy})`, callback_data: `strat:delete:${p.name}` }]);
+      const buttons = presets.map(p => [{ text: `🗑️ ${p.name} (${p.sol === 'max' ? 'MAX' : (typeof p.sol === 'string' && p.sol.endsWith('%')) ? p.sol + ' bal' : p.sol + ' SOL'} | -${p.range}% | ${p.strategy})`, callback_data: `strat:delete:${p.name}` }]);
       buttons.push([{ text: '🔙 Back', callback_data: 'menu:strat' }]);
       return tgEdit(chatId, msgId, '🗑️ HAPUS STRAT\n━━━━━━━━━━━━━━━━━━━━\n\nPilih strat yang mau dihapus:', { inline_keyboard: buttons });
     }
