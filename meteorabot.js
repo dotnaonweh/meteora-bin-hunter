@@ -48,7 +48,16 @@ function loadData() {
   if (!data.presets) data.presets = {};
   return data;
 }
-function saveData() { fs.writeFileSync(DATA_FILE, JSON.stringify(state, null, 2)); }
+function saveData() {
+  // Sanitize before writing — make sure no PK sneaks into wallet name
+  const safe = JSON.parse(JSON.stringify(state));
+  for (const w of Object.values(safe.wallets || {})) {
+    if (/^[1-9A-HJ-NP-Za-km-z]{64,88}$/.test(w.name)) {
+      w.name = 'Wallet';
+    }
+  }
+  fs.writeFileSync(DATA_FILE, JSON.stringify(safe, null, 2));
+}
 const state = loadData();
 
 const extremeSessions = {};
@@ -97,6 +106,17 @@ function addWallet(name, pk) {
 function switchWallet(id) {
   if (!state.wallets[id]) throw new Error('Wallet tidak ditemukan');
   state.activeWalletId = id;
+  saveData();
+}
+function deleteWallet(id) {
+  if (!state.wallets[id]) throw new Error('Wallet tidak ditemukan');
+  const envKey = state.wallets[id].envKey;
+  delete process.env[envKey];
+  delete state.wallets[id];
+  if (state.activeWalletId === id) {
+    state.activeWalletId = Object.keys(state.wallets)[0] || null;
+  }
+  saveEnvFile();
   saveData();
 }
 function getActivePreset() {
@@ -170,6 +190,7 @@ async function openExtremePosition(poolAddress, solAmount) {
     const bal = await getSolBalance(wallet.publicKey.toBase58());
     finalSol = parseFloat((Math.max(0, bal - 0.08)).toFixed(4));
   }
+  if (!finalSol || finalSol < 0.001) throw new Error(`SOL tidak cukup (${finalSol} SOL). Minimal 0.001 SOL + 0.08 untuk fee.`);
   const { dlmmPool, activeBin } = await getPoolAndActiveBin(poolAddress);
   await dlmmPool.refetchStates();
   const targetBinId = activeBin.binId;
@@ -318,7 +339,14 @@ async function extremeMonitorTick(chatId) {
       } else if (currentBinId < session.targetBinId) {
         session.status = 'oor';
         await tgSend(chatId, `⚠️ EXTREME: Out of Range!\n🎯 Target bin: ${session.targetBinId}\n📍 Current bin: ${currentBinId}\n\n⏳ Withdraw & readd token ke bin ${session.targetBinId}...`);
-        const txHash = await withdrawAndReaddToTargetBin(session.poolAddress, session.positionKey, session.targetBinId);
+        let txHash;
+        try {
+          txHash = await withdrawAndReaddToTargetBin(session.poolAddress, session.positionKey, session.targetBinId);
+        } catch (oorErr) {
+          session.status = 'waiting';
+          await tgSend(chatId, `⚠️ Withdraw/readd error: ${oorErr.message}\n👀 Menunggu harga balik ke bin ${session.targetBinId}...`);
+          return;
+        }
         if (txHash === 'no_token') {
           session.status = 'waiting';
           await tgSend(chatId, `⚠️ Ga ada token setelah withdraw. Menunggu harga balik...`);
@@ -372,6 +400,7 @@ async function addLiquidity(poolAddress, solAmount, rangePercent, strategyStr) {
     const bal = await getSolBalance(wallet.publicKey.toBase58());
     finalSol = parseFloat((Math.max(0, bal - 0.08)).toFixed(4));
   }
+  if (!finalSol || finalSol < 0.001) throw new Error(`SOL tidak cukup (${finalSol} SOL). Minimal 0.001 SOL + 0.08 untuk fee.`);
   const dlmmPool = await DLMM.create(connection, new PublicKey(poolAddress));
   await dlmmPool.refetchStates();
   const activeBin = await dlmmPool.getActiveBin();
@@ -502,6 +531,9 @@ function tgEdit(chatId, messageId, text, reply_markup) {
 function tgAnswer(callbackQueryId) {
   return tgRequest('answerCallbackQuery', { callback_query_id: callbackQueryId });
 }
+function tgDelete(chatId, messageId) {
+  return tgRequest('deleteMessage', { chat_id: chatId, message_id: messageId });
+}
 
 function mainMenu(wallet) {
   const walletLine = wallet
@@ -527,14 +559,24 @@ function mainMenu(wallet) {
 }
 
 function walletMenu() {
-  const buttons = Object.values(state.wallets).map(w => [{
-    text: `${w.id === state.activeWalletId ? '✅ ' : ''}${w.name} (${shortKey(w.pubkey)})`,
-    callback_data: `wallet:switch:${w.id}`
-  }]);
+  const buttons = Object.values(state.wallets).map(w => [
+    {
+      text: `${w.id === state.activeWalletId ? '✅ ' : ''}${w.name} (${shortKey(w.pubkey)})`,
+      callback_data: `wallet:switch:${w.id}`
+    },
+    {
+      text: '🗑️',
+      callback_data: `wallet:delete:${w.id}`
+    }
+  ]);
   buttons.push([{ text: '➕ Import Wallet Baru', callback_data: 'wallet:import' }]);
   buttons.push([{ text: '🔙 Back', callback_data: 'menu:main' }]);
-  return { text: '💼 WALLET MANAGER\n━━━━━━━━━━━━━━━━━━━━\n\nPilih wallet aktif atau import baru:', markup: { inline_keyboard: buttons } };
+  const headerText = buttons.length > 0
+    ? '💼 WALLET MANAGER\n━━━━━━━━━━━━━━━━━━━━\n\nPilih wallet aktif atau import baru:'
+    : '💼 WALLET MANAGER\n━━━━━━━━━━━━━━━━━━━━\n\n📭 Belum ada wallet. Import dulu!';
+  return { text: headerText, markup: { inline_keyboard: buttons } };
 }
+
 
 function stratMenu() {
   const presets = Object.values(state.presets);
@@ -563,13 +605,25 @@ function positionCard(posKey, posData, status) {
 }
 
 const userState = {};
+const USER_STATE_TTL = 10 * 60 * 1000; // 10 menit
+function setUserState(chatId, val) {
+  if (userState[chatId]?.timeoutHandle) clearTimeout(userState[chatId].timeoutHandle);
+  const timeoutHandle = setTimeout(() => {
+    clearUserState(chatId);
+  }, USER_STATE_TTL);
+  userState[chatId] = { ...val, timeoutHandle };
+}
+function clearUserState(chatId) {
+  if (userState[chatId]?.timeoutHandle) clearTimeout(userState[chatId].timeoutHandle);
+  delete userState[chatId];
+}
 
-async function handleTgMessage(chatId, text) {
+async function handleTgMessage(chatId, text, messageId) {
   chatIds.add(chatId);
   const us = userState[chatId];
 
   if (us?.step === 'extreme_pool') {
-    delete userState[chatId];
+    clearUserState(chatId);
     const poolAddress = extractPoolAddress(text.trim());
     if (!poolAddress) return tgSend(chatId, '❌ Pool address tidak valid.');
     const solAmount = us.data.solAmount;
@@ -586,7 +640,6 @@ async function handleTgMessage(chatId, text) {
   }
 
   if (us?.step === 'strat_name') {
-    delete userState[chatId];
     const lines = text.trim().split('\n').map(l => l.trim()).filter(Boolean);
     const added = [];
     let lastAdded = null;
@@ -601,7 +654,8 @@ async function handleTgMessage(chatId, text) {
       added.push(sname);
       lastAdded = sname;
     }
-    if (added.length === 0) return tgSend(chatId, '❌ Format salah!\nContoh:\nSETORAN max 7 bidask\nSAFE 1 30 spot');
+    if (added.length === 0) return tgSend(chatId, '❌ Format salah! Coba lagi:\n<nama> <sol|max> <range%> <spot|curve|bidask>\n\nContoh:\nSETORAN max 7 bidask\nSAFE 1 30 spot');
+    clearUserState(chatId);
     if (lastAdded) switchPreset(lastAdded);
     return tgSend(chatId,
       `✅ ${added.length} strat ditambahkan!\n${added.map(s => `• ${s}`).join('\n')}\n\nAktif: ${lastAdded}`,
@@ -610,35 +664,46 @@ async function handleTgMessage(chatId, text) {
   }
 
   if (us?.step === 'strat_edit') {
-    delete userState[chatId];
     const targetId = us.data.id;
     const parts = text.trim().split(/\s+/);
-    if (parts.length < 3) return tgSend(chatId, '❌ Format salah!\nContoh: max 7 bidask');
+    if (parts.length < 3) return tgSend(chatId, '❌ Format salah! Coba lagi:\n<sol|max> <range%> <spot|curve|bidask>\n\nContoh: max 7 bidask');
     const [ssol, srange, sstrat] = parts;
     const sol = ssol === 'max' ? 'max' : parseFloat(ssol);
     const range = parseFloat(srange);
-    if ((isNaN(sol) && ssol !== 'max') || isNaN(range)) return tgSend(chatId, '❌ SOL dan range harus angka!');
+    if ((isNaN(sol) && ssol !== 'max') || isNaN(range)) return tgSend(chatId, '❌ SOL dan range harus angka! Coba lagi:\n<sol|max> <range%> <spot|curve|bidask>');
+    clearUserState(chatId);
     addPreset(targetId, targetId, sol, range, sstrat);
     const sm = stratMenu();
     return tgSend(chatId, `✅ Strat "${targetId}" diupdate!\n💰 ${solLabel(sol)} | -${range}% | ${sstrat}`, sm.markup);
   }
 
   if (us?.step === 'import_name') {
-    userState[chatId] = { step: 'import_pk', data: { name: text.trim() } };
-    return tgSend(chatId, `✏️ Kirim Private Key wallet "${text.trim()}":\n\n⚠️ Hapus pesan PK kamu setelah dikirim!`);
+    const nameInput = text.trim();
+    // Detect if user accidentally sent PK instead of name (base58, 64-88 chars)
+    if (/^[1-9A-HJ-NP-Za-km-z]{64,88}$/.test(nameInput)) {
+      return tgSend(chatId, '❌ Itu kayaknya private key, bukan nama!\n\nKetik nama wallet dulu (contoh: "Main", "Trading"):');
+    }
+    if (nameInput.length > 30) {
+      return tgSend(chatId, '❌ Nama terlalu panjang, maksimal 30 karakter:');
+    }
+    setUserState(chatId, { step: 'import_pk', data: { name: nameInput } });
+    return tgSend(chatId, `✏️ Kirim Private Key wallet "${nameInput}":\n\n⚠️ Hapus pesan PK kamu setelah dikirim!`);
   }
 
   if (us?.step === 'import_pk') {
     const name = us.data.name;
-    delete userState[chatId];
+    // Auto-delete the message containing the PK immediately
+    if (messageId) tgDelete(chatId, messageId).catch(() => {});
     try {
       const result = addWallet(name, text.trim());
-      return tgSend(chatId, `✅ Wallet "${name}" berhasil diimport!\nAddress: ${shortKey(result.pubkey)}\n\n⚠️ Segera hapus pesan PK kamu!`,
+      clearUserState(chatId);
+      return tgSend(chatId, `✅ Wallet "${name}" berhasil diimport!\nAddress: ${shortKey(result.pubkey)}\n\n🗑️ Pesan PK kamu sudah otomatis dihapus.`,
         { inline_keyboard: [[{ text: '🏠 Main Menu', callback_data: 'menu:main' }]] });
-    } catch (e) { return tgSend(chatId, `❌ Private key tidak valid: ${e.message}`); }
+    } catch (e) { return tgSend(chatId, `❌ Private key tidak valid, coba kirim ulang: ${e.message}`); }
   }
 
   if (isPoolInput(text)) {
+    if (userState[chatId]?.step) return; // lagi di flow input, skip
     const wallet = getActiveWallet();
     if (!wallet) return tgSend(chatId, '❌ Import wallet dulu!');
     const poolAddress = extractPoolAddress(text);
@@ -717,6 +782,16 @@ async function handleCallback(callbackQuery) {
     if (data === 'menu:strat') { const sm = stratMenu(); return tgEdit(chatId, msgId, sm.text, sm.markup); }
     if (data === 'menu:extreme') {
       const preset = getActivePreset();
+      if (!preset) {
+        return tgEdit(chatId, msgId,
+          '💥 EXTREME MODE\n━━━━━━━━━━━━━━━━━━━━\n\n⚠️ Belum ada preset! Buat preset dulu di menu Strategy, atau pakai MAX SOL langsung.',
+          { inline_keyboard: [
+            [{ text: '💰 Pakai MAX SOL', callback_data: 'extreme:start:max' }],
+            [{ text: '⚡ Buat Preset Dulu', callback_data: 'menu:strat' }],
+            [{ text: '🔙 Back', callback_data: 'menu:main' }]
+          ]}
+        );
+      }
       return tgEdit(chatId, msgId,
         `💥 EXTREME MODE\n━━━━━━━━━━━━━━━━━━━━\n\n🎯 1 bin | BidAsk | Auto-rebalance\n⏱️ Monitor: 2.5 detik\n💰 SOL: ${solLabel(preset.sol)}\n\n⚠️ Mode ini agresif! Bot akan terus rebalance selama aktif.\n\nPaste link pool untuk mulai:`,
         { inline_keyboard: [[{ text: `💰 Pakai ${solLabel(preset.sol)} (preset aktif)`, callback_data: `extreme:start:${preset.sol === 'max' ? 'max' : preset.sol}` }], [{ text: '🔙 Back', callback_data: 'menu:main' }]] }
@@ -724,11 +799,12 @@ async function handleCallback(callbackQuery) {
     }
 
     if (ns === 'extreme' && action === 'start') {
-      userState[chatId] = { step: 'extreme_pool', data: { solAmount: param === 'max' ? 'max' : parseFloat(param) } };
+      setUserState(chatId, { step: 'extreme_pool', data: { solAmount: param === 'max' ? 'max' : parseFloat(param) } });
       return tgEdit(chatId, msgId, `💥 EXTREME MODE\n━━━━━━━━━━━━━━━━━━━━\n\nPaste link pool Meteora:`, { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu:main' }]] });
     }
     if (ns === 'extreme' && action === 'stop') {
       const targetChatId = parseInt(param);
+      if (isNaN(targetChatId)) return tgEdit(chatId, msgId, '❌ Session tidak valid.', { inline_keyboard: [[{ text: '🏠 Main Menu', callback_data: 'menu:main' }]] });
       stopExtremeSession(targetChatId);
       return tgEdit(chatId, msgId,
         `🛑 EXTREME MODE DIHENTIKAN\n━━━━━━━━━━━━━━━━━━━━\n\nTotal cycles: ${extremeSessions[targetChatId]?.cycleCount || 0}\n\n⚠️ Posisi masih aktif on-chain! Gunakan menu Posisi untuk remove jika perlu.`,
@@ -736,15 +812,15 @@ async function handleCallback(callbackQuery) {
       );
     }
 
-    if (ns === 'strat' && action === 'switch') { switchPreset(param); const p = state.presets[param]; const sm = stratMenu(); return tgEdit(chatId, msgId, `✅ Strat aktif: ${p.name}\n💰 ${solLabel(p.sol)} | -${p.range}% | ${p.strategy}\n\n` + sm.text, sm.markup); }
-    if (ns === 'strat' && action === 'add') { userState[chatId] = { step: 'strat_name' }; return tgEdit(chatId, msgId, '➕ TAMBAH STRAT\n━━━━━━━━━━━━━━━━━━━━\n\nKetik 1 atau beberapa strat (1 per baris):\n<nama> <sol|max> <range%> <spot|curve|bidask>\n\nContoh:\nSETORAN max 7 bidask\nSAFE 1 30 spot', { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu:strat' }]] }); }
+    if (ns === 'strat' && action === 'switch') { if (!state.presets[param]) return tgEdit(chatId, msgId, '❌ Preset tidak ditemukan.', { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu:strat' }]] }); switchPreset(param); const p = state.presets[param]; const sm = stratMenu(); return tgEdit(chatId, msgId, `✅ Strat aktif: ${p.name}\n💰 ${solLabel(p.sol)} | -${p.range}% | ${p.strategy}\n\n` + sm.text, sm.markup); }
+    if (ns === 'strat' && action === 'add') { setUserState(chatId, { step: 'strat_name' }); return tgEdit(chatId, msgId, '➕ TAMBAH STRAT\n━━━━━━━━━━━━━━━━━━━━\n\nKetik 1 atau beberapa strat (1 per baris):\n<nama> <sol|max> <range%> <spot|curve|bidask>\n\nContoh:\nSETORAN max 7 bidask\nSAFE 1 30 spot', { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu:strat' }]] }); }
     if (ns === 'strat' && action === 'edit_list') {
       const presets = Object.values(state.presets);
       const buttons = presets.map(p => [{ text: `✏️ ${p.name} (${p.sol === 'max' ? 'MAX' : p.sol + ' SOL'} | -${p.range}% | ${p.strategy})`, callback_data: `strat:edit:${p.name}` }]);
       buttons.push([{ text: '🔙 Back', callback_data: 'menu:strat' }]);
       return tgEdit(chatId, msgId, '✏️ EDIT STRAT\n━━━━━━━━━━━━━━━━━━━━\n\nPilih strat yang mau diedit:', { inline_keyboard: buttons });
     }
-    if (ns === 'strat' && action === 'edit') { userState[chatId] = { step: 'strat_edit', data: { id: param } }; const p = state.presets[param]; return tgEdit(chatId, msgId, `✏️ Edit strat "${param}"\nSekarang: ${solLabel(p.sol)} | -${p.range}% | ${p.strategy}\n\nKetik nilai baru:\n<sol|max> <range%> <spot|curve|bidask>`, { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'strat:edit_list' }]] }); }
+    if (ns === 'strat' && action === 'edit') { const p = state.presets[param]; if (!p) return tgEdit(chatId, msgId, '❌ Preset tidak ditemukan.', { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu:strat' }]] }); setUserState(chatId, { step: 'strat_edit', data: { id: param } }); return tgEdit(chatId, msgId, `✏️ Edit strat "${param}"\nSekarang: ${solLabel(p.sol)} | -${p.range}% | ${p.strategy}\n\nKetik nilai baru:\n<sol|max> <range%> <spot|curve|bidask>`, { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'strat:edit_list' }]] }); }
     if (ns === 'strat' && action === 'delete_list') {
       const presets = Object.values(state.presets);
       if (presets.length === 0) return tgEdit(chatId, msgId, '❌ Tidak ada strat yang bisa dihapus.', { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu:strat' }]] });
@@ -754,8 +830,25 @@ async function handleCallback(callbackQuery) {
     }
     if (ns === 'strat' && action === 'delete') { deletePreset(param); const sm = stratMenu(); return tgEdit(chatId, msgId, `✅ Strat "${param}" dihapus.\n\n` + sm.text, sm.markup); }
 
-    if (ns === 'wallet' && action === 'import') { userState[chatId] = { step: 'import_name' }; return tgEdit(chatId, msgId, '💼 IMPORT WALLET\n━━━━━━━━━━━━━━━━━━━━\n\nKetik nama untuk wallet ini:', { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu:wallet' }]] }); }
+    if (ns === 'wallet' && action === 'import') { setUserState(chatId, { step: 'import_name' }); return tgEdit(chatId, msgId, '💼 IMPORT WALLET\n━━━━━━━━━━━━━━━━━━━━\n\nKetik nama untuk wallet ini:', { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'menu:wallet' }]] }); }
     if (ns === 'wallet' && action === 'switch') { switchWallet(param); const wMenu = walletMenu(); return tgEdit(chatId, msgId, `✅ Wallet aktif: ${state.wallets[param]?.name}\n\n` + wMenu.text, wMenu.markup); }
+    if (ns === 'wallet' && action === 'delete') {
+      const w = state.wallets[param];
+      if (!w) return tgEdit(chatId, msgId, '❌ Wallet tidak ditemukan.', { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu:wallet' }]] });
+      return tgEdit(chatId, msgId,
+        `🗑️ Hapus wallet "${w.name}"?\n📍 ${w.pubkey}\n\n⚠️ Private key akan dihapus dari .env!`,
+        { inline_keyboard: [
+          [{ text: '✅ Ya, hapus', callback_data: `wallet:confirmdelete:${param}` }, { text: '❌ Batal', callback_data: 'menu:wallet' }]
+        ]}
+      );
+    }
+    if (ns === 'wallet' && action === 'confirmdelete') {
+      const w = state.wallets[param];
+      const name = w?.name || param;
+      deleteWallet(param);
+      const wMenu = walletMenu();
+      return tgEdit(chatId, msgId, `✅ Wallet "${name}" dihapus.\n\n` + wMenu.text, wMenu.markup);
+    }
 
     if (ns === 'pos' && (action === 'view' || action === 'status')) {
       const posData = state.positions[param];
@@ -782,7 +875,7 @@ async function tgPoll() {
     if (data.ok && data.result.length > 0) {
       for (const update of data.result) {
         tgOffset = update.update_id + 1;
-        if (update.message?.text) handleTgMessage(update.message.chat.id, update.message.text).catch(e => console.error('[TG]', e.message));
+        if (update.message?.text) handleTgMessage(update.message.chat.id, update.message.text, update.message.message_id).catch(e => console.error('[TG]', e.message));
         if (update.callback_query) handleCallback(update.callback_query).catch(e => console.error('[Callback]', e.message));
       }
     }
