@@ -8,6 +8,7 @@ const fs = require('fs');
 const StrategyType = { Spot: 0, Curve: 1, BidAsk: 2 };
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const MONITOR_INTERVAL = 2500;
+const DLMM_PNL_API = 'https://dlmm.datapi.meteora.ag/positions';
 
 const RPC_LIST = [
   { label: 'Helius', url: 'https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_API_KEY' },
@@ -458,7 +459,9 @@ async function getPositionStatus(positionKey) {
   if (!posData) return null;
   const dlmmPool = await DLMM.create(connection, new PublicKey(posData.poolAddress));
   const activeBin = await dlmmPool.getActiveBin();
-  return { ...posData, currentBin: activeBin.binId, inRange: activeBin.binId >= posData.minBinId && activeBin.binId <= posData.maxBinId };
+  const wallet = getActiveWallet();
+  const pnlData = wallet ? await fetchPositionPnL(posData.poolAddress, wallet.publicKey.toBase58()) : null;
+  return { ...posData, currentBin: activeBin.binId, inRange: activeBin.binId >= posData.minBinId && activeBin.binId <= posData.maxBinId, pnl: pnlData };
 }
 
 async function syncPositions() {
@@ -505,6 +508,31 @@ function fetchJSON(url, options) {
       res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
     }).on('error', reject);
   });
+}
+
+async function fetchPositionPnL(poolAddress, walletPubkey) {
+  try {
+    const url = `${DLMM_PNL_API}/${poolAddress}/pnl?user=${walletPubkey}&status=open`;
+    const data = await fetchJSON(url);
+    if (data.positions && data.positions.length > 0) {
+      return {
+        pnlUsd: parseFloat(data.positions[0].pnlUsd) || 0,
+        pnlSol: parseFloat(data.positions[0].pnlSol) || 0,
+        pnlPctChange: parseFloat(data.positions[0].pnlPctChange) || 0,
+        unrealizedPnlSol: parseFloat(data.positions[0].unrealizedPnl?.balancesSol) || 0,
+        unclaimedFeeTokenX: data.positions[0].unrealizedPnl?.unclaimedFeeTokenX || {},
+        unclaimedFeeTokenY: data.positions[0].unrealizedPnl?.unclaimedFeeTokenY || {},
+        allTimeFees: data.positions[0].allTimeFees || {},
+        tokenXSymbol: data.tokenX === SOL_MINT ? 'SOL' : 'TOKEN',
+        tokenYSymbol: data.tokenY === SOL_MINT ? 'SOL' : 'TOKEN',
+        solPrice: parseFloat(data.solPrice) || 0,
+      };
+    }
+    return null;
+  } catch (e) {
+    console.error('[PnL] Fetch error:', e.message);
+    return null;
+  }
 }
 function tgRequest(method, payload) {
   return new Promise((resolve, reject) => {
@@ -597,8 +625,21 @@ function stratMenu() {
 function positionCard(posKey, posData, status) {
   const si = posData.solAmount > 0 ? `${posData.solAmount} SOL` : 'Unknown';
   const ri = posData.rangePercent > 0 ? `-${posData.rangePercent}%` : `${posData.maxBinId - posData.minBinId} bins`;
+  let pnlLine = '';
+  if (status?.pnl) {
+    const p = status.pnl;
+    const pnlSign = p.pnlSol >= 0 ? '+' : '';
+    const pnlPctSign = p.pnlPctChange >= 0 ? '+' : '';
+    const unrealSign = p.unrealizedPnlSol >= 0 ? '+' : '';
+    pnlLine = `\n💵 PnL: ${pnlSign}${p.pnlSol.toFixed(4)} SOL (${pnlPctSign}${p.pnlPctChange.toFixed(2)}%)\n📊 Unrealized: ${unrealSign}${p.unrealizedPnlSol.toFixed(4)} SOL`;
+    if (p.unclaimedFeeTokenX?.amountSol || p.unclaimedFeeTokenY?.amountSol) {
+      const feeX = parseFloat(p.unclaimedFeeTokenX?.amountSol || 0);
+      const feeY = parseFloat(p.unclaimedFeeTokenY?.amountSol || 0);
+      pnlLine += `\n🤑 Fees: +${feeX.toFixed(4)} SOL (X) +${feeY.toFixed(6)} SOL (Y)`;
+    }
+  }
   return {
-    text: `📊 POSISI AKTIF\n━━━━━━━━━━━━━━━━━━━━\n🏊 Pool: ${shortKey(posData.poolAddress)}\n📍 Position: ${shortKey(posKey)}\n💰 SOL: ${si} | Range: ${ri}\n📊 Bins: ${posData.minBinId} → ${posData.maxBinId}\n📐 Strategy: ${posData.strategyStr.toUpperCase()}\n📈 Status: ${status?.inRange ? '✅ In Range' : '⚠️ Out of Range'}\n🕐 Added: ${new Date(posData.addedAt).toLocaleString('id-ID')}\n━━━━━━━━━━━━━━━━━━━━`,
+    text: `📊 POSISI AKTIF\n━━━━━━━━━━━━━━━━━━━━\n🏊 Pool: ${shortKey(posData.poolAddress)}\n📍 Position: ${shortKey(posKey)}\n💰 SOL: ${si} | Range: ${ri}\n📊 Bins: ${posData.minBinId} → ${posData.maxBinId}\n📐 Strategy: ${posData.strategyStr.toUpperCase()}\n📈 Status: ${status?.inRange ? '✅ In Range' : '⚠️ Out of Range'}${pnlLine}\n🕐 Added: ${new Date(posData.addedAt).toLocaleString('id-ID')}\n━━━━━━━━━━━━━━━━━━━━`,
     markup: {
       inline_keyboard: [
         [{ text: '🗑️ Remove LP', callback_data: `pos:remove:${posKey}` }, { text: '🔄 Refresh', callback_data: `pos:status:${posKey}` }],
