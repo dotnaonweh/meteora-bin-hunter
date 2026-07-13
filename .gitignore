@@ -1,7 +1,9 @@
-data.json
 node_modules/
+dist/
+dist-test/
 .env
-scanner_state.json
-pending_addlp.json
-old.js
-package-lock.json
+.env.*
+!.env.example
+data.json
+*.tmp
+*.log
