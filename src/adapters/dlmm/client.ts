@@ -435,17 +435,26 @@ export class DlmmClient {
  * Removes the init+extend instructions that the SDK repeats across every
  * transaction group of an extended position.
  *
- * Each group looks like:
- *   [ computeBudgetIx(own), initPositionIx, ...extendIxs, ...chunkTail ]
+ * A real group, dumped from the SDK against a mainnet pool:
  *
- * `initPositionIx` and `extendIxs` are the *same object references* in every
- * group — only the leading compute-budget instruction and the trailing
- * chunk-specific instructions differ. Landing them more than once fails on-chain
- * ("account already in use"), so we keep them only in the first group.
+ *   tx1: [ ComputeBudget, initialize_position2, increase_position_length2,
+ *          initialize_bin_array x2, createATA(idempotent) x2, ..., rebalance_liquidity ]
+ *   tx2: [ ComputeBudget, initialize_position2*, increase_position_length2*,
+ *          initialize_bin_array, createATA(idempotent) x2*, ..., rebalance_liquidity ]
+ *                          (* = the SAME object reference as in tx1)
  *
- * The shared length is discovered by reference equality rather than assumed,
- * so a change in how many instructions the SDK shares cannot silently corrupt
- * the batch.
+ * `initialize_position2` and `increase_position_length2` are the two that MUST
+ * land exactly once — sending them twice fails with "account already in use".
+ * They form a contiguous run right after the compute-budget instruction, so they
+ * are stripped from every group after the first, matched by reference equality
+ * rather than an assumed length.
+ *
+ * The other repeats are deliberately left alone, because both are verified
+ * idempotent against mainnet:
+ *   - `initialize_bin_array` is `init_if_needed` — simulating it against an
+ *     already-initialised bin array returns success, not an error.
+ *   - the ATA instructions are the idempotent variant (`data = [1]`).
+ * That is also why the SDK is happy to emit them in more than one transaction.
  */
 function stripSharedPrefix(groups: readonly TransactionInstruction[][]): TransactionInstruction[][] {
   const first = groups[0];
