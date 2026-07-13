@@ -144,11 +144,32 @@ export function looksLikeSecretKey(text: string): boolean {
   return BASE58_SECRET_RE.test(text.trim());
 }
 
-/** Number of bins spanned by a percentage range at a given bin step.
- *  A bin step is in basis points, so each bin is `binStep/10000` wide. */
+/**
+ * Number of bins needed to span a `rangePercent` price move.
+ *
+ * DLMM bin prices are GEOMETRIC — `price(binId) = (1 + binStep/10000)^binId`, so
+ * each bin compounds on the last. v1 divided linearly, which undershoots badly:
+ * at binStep 100 a "-49%" preset opened only 49 bins (≈ -38% of real range), not
+ * the 68 bins actually required. Every wide preset was silently narrower than
+ * requested, going out of range earlier than intended.
+ *
+ *   bins = ceil( -ln(1 - pct/100) / ln(1 + binStep/10000) )
+ */
 export function rangeToBins(rangePercent: number, binStep: number): number {
   if (binStep <= 0) throw recoverable('parse.binStep', 'Pool has an invalid bin step');
-  return Math.max(1, Math.ceil(rangePercent / 100 / (binStep / 10_000)));
+
+  const priceRatio = 1 - rangePercent / 100;
+  if (priceRatio <= 0) {
+    throw recoverable('parse.range', 'Range must be below 100% — a 100% drop is an infinite number of bins.');
+  }
+  const perBinRatio = 1 + binStep / 10_000;
+  return Math.max(1, Math.ceil(-Math.log(priceRatio) / Math.log(perBinRatio)));
+}
+
+/** Inverse of `rangeToBins`: the downside % that `bins` bins actually reach. */
+export function binsToRange(bins: number, binStep: number): number {
+  const perBinRatio = 1 + binStep / 10_000;
+  return (1 - 1 / perBinRatio ** bins) * 100;
 }
 
 /** Every base58-looking address in a blob of text. Used only for redaction checks. */

@@ -79,7 +79,28 @@ SAFE  1   30 spot
 HALF  50% 5  bidask
 ```
 
-`max` uses your whole balance minus the fee reserve (default 0.08 SOL). `50%` uses half of what's usable.
+`max` uses your whole balance minus the reserve needed for rent and fees. `50%` uses half of what's usable.
+
+### Wide range (beyond -50%)
+
+A **classic** DLMM position holds at most 70 bins. Bins are geometric — each is a `(1 + binStep/10000)` step — so at binStep 100 those 70 bins reach exactly **-50.17%**. That's the familiar "-49%" wall.
+
+Anything wider automatically escalates to a resizable **extended position** (up to 1400 bins), the same path the official Meteora app uses. It can't fit in one transaction, so the deposit is landed across several:
+
+| Range @ binStep 100 | Bins | Path |
+|---|---|---|
+| -30% | 36 | classic, 1 tx |
+| -50% | 70 | classic, 1 tx |
+| -51% | 72 | **extended**, multi-tx |
+| -67% | 112 | **extended**, multi-tx |
+| -70% | 121 | **extended**, multi-tx |
+
+How wide you can go depends entirely on the pool's bin step. A fine-grained pool simply cannot reach a wide range — binStep 4 tops out around **-42.9%** even with all 1400 bins — so the bot rejects it up front with the actual reachable maximum instead of failing deep inside the SDK.
+
+> [!IMPORTANT]
+> **v1's range math was wrong.** It divided linearly (`range% / binStep%`) when bins compound geometrically, so it always **undershot**: a `-49%` preset opened only 49 bins (≈ **-38%** of real range), not the 68 actually needed. Every preset you have ever run opened a *narrower* position than you asked for and went out of range earlier than intended. This is now correct — which means your existing presets will behave differently (wider, holding range longer, with the same SOL spread over more bins).
+
+Rent scales with bin count, so `max` and `N%` sizing now price the *actual* range being opened — position rent plus any bin arrays and token accounts that don't exist yet — rather than assuming a flat 0.08 SOL. A 1400-bin position can need well over 1 SOL of rent; a flat reserve would size the deposit to consume the balance and then fail.
 
 **Auto LP** — paste a pool link, and the active preset is applied:
 

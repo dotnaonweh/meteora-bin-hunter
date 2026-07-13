@@ -10,6 +10,7 @@ import {
   parseSolAmount,
   parseStrategy,
   rangeToBins,
+  binsToRange,
   resolveSolAmount,
 } from '../src/utils/parse.js';
 
@@ -159,10 +160,54 @@ describe('parsePresetLines', () => {
 });
 
 describe('rangeToBins', () => {
-  it('converts a percentage range into a bin count at a given bin step', () => {
-    // binStep 20 = 0.2% per bin; a 7% range spans ceil(7/0.2) = 35 bins.
-    assert.equal(rangeToBins(7, 20), 35);
-    assert.equal(rangeToBins(1, 100), 1);
+  /**
+   * DLMM bin prices are GEOMETRIC: price(n) = (1 + binStep/1e4)^n. v1 divided
+   * linearly, which undershoots — so every wide preset silently opened a
+   * narrower position than asked for and went out of range early.
+   */
+  it('uses geometric bin pricing, not linear division', () => {
+    // -70% at binStep 100 (1%/bin). Linear says 70 bins. The truth is 121:
+    //   1.01^121 = 3.33  ->  1 - 1/3.33 = 70%
+    assert.equal(rangeToBins(70, 100), 121);
+    assert.notEqual(rangeToBins(70, 100), 70, 'the linear answer would be 70 — that is the v1 bug');
+  });
+
+  it('round-trips against binsToRange', () => {
+    for (const [pct, binStep] of [
+      [7, 20],
+      [30, 100],
+      [49, 100],
+      [67, 100],
+      [70, 20],
+    ] as const) {
+      const bins = rangeToBins(pct, binStep);
+      const actual = binsToRange(bins, binStep);
+      assert.ok(actual >= pct, `${bins} bins reach ${actual.toFixed(2)}%, must cover the requested ${pct}%`);
+      // And not wastefully wide: one bin fewer must fall short.
+      assert.ok(binsToRange(bins - 1, binStep) < pct, 'should be the minimum bin count that covers the range');
+    }
+  });
+
+  /**
+   * The "-49%" wall, pinned. A classic position holds at most 70 bins, which at
+   * binStep 100 reaches -50.17%. Anything past that needs an extended position —
+   * which is exactly why -67% / -70% were unreachable before.
+   */
+  it('pins the classic single-position ceiling', () => {
+    const reach = binsToRange(70, 100);
+    assert.ok(reach > 50 && reach < 51, `70 bins at binStep 100 reach ${reach.toFixed(2)}% — the wall`);
+
+    assert.ok(rangeToBins(50, 100) <= 70, '-50% still fits a classic position');
+    assert.ok(rangeToBins(51, 100) > 70, '-51% must escalate to an extended position');
+    assert.ok(rangeToBins(67, 100) > 70, '-67% must escalate to an extended position');
+    assert.ok(rangeToBins(70, 100) > 70, '-70% must escalate to an extended position');
+  });
+
+  it('wide ranges stay within the 1400-bin extended limit on coarse pools', () => {
+    assert.ok(rangeToBins(67, 100) <= 1400);
+    assert.ok(rangeToBins(70, 100) <= 1400);
+    // But a fine bin step cannot reach a wide range at all.
+    assert.ok(rangeToBins(70, 4) > 1400, 'binStep 4 cannot reach -70% — must be rejected with a clear message');
   });
 
   it('always spans at least one bin', () => {
@@ -170,7 +215,11 @@ describe('rangeToBins', () => {
   });
 
   it('rejects a zero bin step rather than dividing by zero', () => {
-    // The original would have produced Infinity here and passed it to the SDK.
+    // v1 would have produced Infinity here and passed it to the SDK.
     assert.throws(() => rangeToBins(7, 0), AppError);
+  });
+
+  it('rejects a 100% range instead of returning Infinity', () => {
+    assert.throws(() => rangeToBins(100, 100), AppError);
   });
 });
