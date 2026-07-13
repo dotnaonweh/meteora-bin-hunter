@@ -27,3 +27,17 @@ export const BASE58_SECRET_RE = /^[1-9A-HJ-NP-Za-km-z]{64,88}$/;
 /** The DLMM program. Used to verify a pasted address is actually a pool
  *  before we send funds to it. */
 export const DLMM_PROGRAM_ID = 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo';
+
+/**
+ * Bin-width limits, from the DLMM program.
+ *
+ * A *classic* position spans at most 70 bins (`DEFAULT_BIN_PER_POSITION`), which
+ * is where the familiar "-49%" ceiling comes from: 69 bins below the active one
+ * at binStep 100 reaches exactly -49.7%.
+ *
+ * Wider ranges need a resizable *extended* position (`initializePosition2` +
+ * `increasePositionLength2`), which goes up to 1400 bins — the same path the
+ * official Meteora app uses for wide ranges.
+ */
+export const MAX_BINS_PER_POSITION = 70;
+export const MAX_BINS_EXTENDED = 1400;

@@ -1,13 +1,20 @@
 import type { Keypair } from '@solana/web3.js';
 import type { Config } from '../config/index.js';
+import { MAX_BINS_EXTENDED } from '../constants/index.js';
 import { recoverable } from '../core/errors.js';
 import type { DlmmClient } from '../adapters/dlmm/client.js';
 import type { PoolCache } from '../adapters/dlmm/pool-cache.js';
+import { estimateLpReserveSol } from '../adapters/dlmm/rent.js';
 import type { Logger } from '../observability/logger.js';
+import type { Metrics } from '../observability/metrics.js';
+import type { RpcPool } from '../providers/rpc/endpoint-pool.js';
 import type { PositionRegistry } from '../state/positions.js';
 import type { WalletRegistry } from '../state/wallets.js';
 import type { Preset, TrackedPosition } from '../types/domain.js';
-import { rangeToBins, resolveSolAmount } from '../utils/parse.js';
+import { binsToRange, rangeToBins, resolveSolAmount } from '../utils/parse.js';
+
+/** Smallest deposit worth opening a position for. */
+const MIN_LP_SOL = 0.001;
 
 export interface AddLiquidityResult {
   readonly positionKey: string;
@@ -28,31 +35,47 @@ export class LiquidityService {
     private readonly pools: PoolCache,
     private readonly wallets: WalletRegistry,
     private readonly positions: PositionRegistry,
+    private readonly rpc: RpcPool,
     private readonly cfg: Config,
     private readonly log: Logger,
+    private readonly metrics: Metrics,
   ) {}
 
-  /** Resolves a preset's sizing against the live balance, with a floor check. */
-  private async sizePosition(owner: Keypair, preset: Preset, signal?: AbortSignal): Promise<number> {
+  /**
+   * Resolves a preset's sizing against the live balance.
+   *
+   * `reserveSol` is the SOL that must be left behind. For `max`/`N%` it is
+   * priced from the actual range being opened, because rent scales with bin
+   * count: a wide position plus brand-new bin arrays can need well over 1 SOL,
+   * and v1's flat 0.08 reserve would size the deposit to eat the whole balance
+   * and then fail for want of rent.
+   */
+  private async sizePosition(
+    owner: Keypair,
+    preset: Preset,
+    reserveSol: number,
+    signal?: AbortSignal,
+  ): Promise<number> {
+    const balance = await this.dlmm.solBalance(owner.publicKey, signal);
+
     if (preset.sol.kind === 'fixed') {
-      // Even a fixed size must be affordable.
-      const balance = await this.dlmm.solBalance(owner.publicKey, signal);
-      if (balance - this.cfg.wallet.feeReserveSol < preset.sol.sol) {
+      // Even a fixed size must be affordable alongside the reserve.
+      if (balance - reserveSol < preset.sol.sol) {
         throw recoverable(
           'liquidity.insufficientSol',
-          `Insufficient SOL: need ${preset.sol.sol} + ${this.cfg.wallet.feeReserveSol} reserve, have ${balance.toFixed(4)}.`,
+          `Insufficient SOL: need ${preset.sol.sol} + ~${reserveSol.toFixed(4)} for rent/fees, have ${balance.toFixed(4)}.`,
         );
       }
       return preset.sol.sol;
     }
 
-    const balance = await this.dlmm.solBalance(owner.publicKey, signal);
-    const sized = resolveSolAmount(preset.sol, balance, this.cfg.wallet.feeReserveSol);
+    const sized = resolveSolAmount(preset.sol, balance, reserveSol);
 
-    if (sized < 0.001) {
+    if (sized < MIN_LP_SOL) {
       throw recoverable(
         'liquidity.insufficientSol',
-        `Insufficient SOL (${sized.toFixed(4)} usable). Need at least 0.001 plus a ${this.cfg.wallet.feeReserveSol} SOL fee reserve.`,
+        `Insufficient SOL (${sized.toFixed(4)} usable of ${balance.toFixed(4)}). ` +
+          `This range needs ~${reserveSol.toFixed(4)} SOL for rent and fees.`,
       );
     }
     return sized;
@@ -64,15 +87,36 @@ export class LiquidityService {
     // `getFresh(force)` validates the address is a real DLMM pool before we
     // size anything or send funds anywhere.
     const pool = await this.pools.getFresh(poolAddress, true);
-    const solUsed = await this.sizePosition(owner, preset, signal);
 
     const activeBinId = pool.lbPair.activeId;
-    const bins = rangeToBins(preset.range, pool.lbPair.binStep);
+    const binStep = pool.lbPair.binStep;
+    const bins = rangeToBins(preset.range, binStep);
 
-    // Same geometry as the original: the range sits *below* the active bin, so
-    // a SOL-only deposit is entirely on the quote side.
-    const minBinId = activeBinId - bins;
+    if (bins > MAX_BINS_EXTENDED) {
+      // Fail here with something actionable rather than deep inside the SDK.
+      // At a fine bin step a wide range is simply unreachable.
+      throw recoverable(
+        'liquidity.rangeTooWide',
+        `-${preset.range}% needs ${bins} bins at this pool's bin step (${binStep}), ` +
+          `over the ${MAX_BINS_EXTENDED}-bin limit. The widest this pool supports is ` +
+          `about -${binsToRange(MAX_BINS_EXTENDED, binStep).toFixed(1)}%.`,
+      );
+    }
+
+    // The range sits *below* the active bin, so a SOL-only deposit is entirely
+    // on the quote side. `maxBinId` occupies one bin itself, so minBinId only
+    // descends `bins - 1` further — v1 omitted the +1 and opened positions one
+    // bin wider than requested.
     const maxBinId = activeBinId;
+    const minBinId = activeBinId - bins + 1;
+
+    // Price the reserve against this exact range before sizing the deposit.
+    const reserveSol =
+      preset.sol.kind === 'fixed'
+        ? this.cfg.wallet.feeReserveSol
+        : await estimateLpReserveSol(this.rpc, this.metrics, pool, minBinId, maxBinId, owner.publicKey, signal);
+
+    const solUsed = await this.sizePosition(owner, preset, reserveSol, signal);
 
     const result = await this.dlmm.openPosition({
       poolAddress,

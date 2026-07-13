@@ -90,7 +90,7 @@ async function main(): Promise<void> {
   const dlmm = new DlmmClient(pools, tx, rpc, cfg, logger, metrics);
   const pnl = new PnlClient(http, logger, metrics);
 
-  const liquidity = new LiquidityService(dlmm, pools, wallets, positions, cfg, logger);
+  const liquidity = new LiquidityService(dlmm, pools, wallets, positions, rpc, cfg, logger, metrics);
   const positionsService = new PositionService(dlmm, pnl, wallets, positions, logger);
   const extreme = new ExtremeManager({ dlmm, pools, subscriptions, cfg, logger, metrics }, logger, metrics);
 

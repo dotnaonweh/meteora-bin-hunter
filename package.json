@@ -17,6 +17,7 @@
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.1",
     "@meteora-ag/dlmm": "^1.9.13",
+    "@solana/spl-token": "^0.4.15",
     "@solana/web3.js": "^1.98.4",
     "bn.js": "^5.2.5",
     "bs58": "^6.0.0",
