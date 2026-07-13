@@ -10,7 +10,7 @@ import {
   SOL_MINT,
   type StrategyTypeValue,
 } from '../../constants/index.js';
-import { recoverable } from '../../core/errors.js';
+import { AppError, classify, recoverable } from '../../core/errors.js';
 import { sleep } from '../../net/retry.js';
 import type { Logger } from '../../observability/logger.js';
 import type { Metrics } from '../../observability/metrics.js';
@@ -236,23 +236,51 @@ export class DlmmClient {
 
     // Sequential, not parallel: the first transaction creates the position
     // account that every later one depends on.
+    const positionKey = positionKeypair.publicKey.toBase58();
     let signature = '';
+
     for (let i = 0; i < groups.length; i++) {
       const ixs = groups[i];
       if (!ixs || ixs.length === 0) continue;
 
       const tx = new Transaction({ feePayer: params.owner.publicKey }).add(...ixs);
-      signature = await this.tx.send(tx, {
-        // Only the first transaction creates the position account, so only it
-        // needs the position keypair's signature.
-        signers: i === 0 ? [params.owner, positionKeypair] : [params.owner],
-        signal: params.signal,
-        label: `openExtended[${i + 1}/${groups.length}]`,
-      });
+
+      try {
+        signature = await this.tx.send(tx, {
+          // Only the first transaction creates the position account, so only it
+          // needs the position keypair's signature.
+          signers: i === 0 ? [params.owner, positionKeypair] : [params.owner],
+          signal: params.signal,
+          label: `openExtended[${i + 1}/${groups.length}]`,
+        });
+      } catch (e) {
+        // A wide range can be 18+ transactions. If one fails partway, the
+        // position ALREADY EXISTS on-chain and already holds funds — so the
+        // failure must carry the position key upward, or the caller would throw
+        // it away and the bot would lose track of real money.
+        if (i === 0) throw e; // nothing was created; a clean failure
+
+        this.metrics.increment('dlmm.extendedPartial');
+        this.log.error('extended position partially funded', {
+          position: positionKey,
+          landed: i,
+          total: groups.length,
+        });
+
+        throw new AppError(
+          'position.partiallyFunded',
+          `Position was created but only ${i} of ${groups.length} deposit transactions landed. ` +
+            `It exists on-chain and holds funds — it has been saved so you can remove it from Positions. ` +
+            `Cause: ${classify(e).message}`,
+          'recoverable',
+          { positionKey, minBinId: params.minBinId, maxBinId: params.maxBinId, landed: i, total: groups.length },
+          { cause: e },
+        );
+      }
       this.metrics.increment('dlmm.extendedChunks');
     }
 
-    return { positionKey: positionKeypair.publicKey.toBase58(), signature };
+    return { positionKey, signature };
   }
 
   /**

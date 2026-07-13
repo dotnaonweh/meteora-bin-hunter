@@ -1,7 +1,7 @@
 import type { Keypair } from '@solana/web3.js';
 import type { Config } from '../config/index.js';
 import { MAX_BINS_EXTENDED } from '../constants/index.js';
-import { recoverable } from '../core/errors.js';
+import { classify, recoverable } from '../core/errors.js';
 import type { DlmmClient } from '../adapters/dlmm/client.js';
 import type { PoolCache } from '../adapters/dlmm/pool-cache.js';
 import { estimateLpReserveSol } from '../adapters/dlmm/rent.js';
@@ -10,7 +10,7 @@ import type { Metrics } from '../observability/metrics.js';
 import type { RpcPool } from '../providers/rpc/endpoint-pool.js';
 import type { PositionRegistry } from '../state/positions.js';
 import type { WalletRegistry } from '../state/wallets.js';
-import type { Preset, TrackedPosition } from '../types/domain.js';
+import type { Preset } from '../types/domain.js';
 import { binsToRange, rangeToBins, resolveSolAmount } from '../utils/parse.js';
 
 /** Smallest deposit worth opening a position for. */
@@ -118,30 +118,51 @@ export class LiquidityService {
 
     const solUsed = await this.sizePosition(owner, preset, reserveSol, signal);
 
-    const result = await this.dlmm.openPosition({
-      poolAddress,
-      owner,
-      solAmount: solUsed,
-      minBinId,
-      maxBinId,
-      strategy: preset.strategy,
-      signal,
-    });
-
-    const tracked: TrackedPosition = {
-      positionKey: result.positionKey,
-      poolAddress,
-      minBinId,
-      maxBinId,
-      solAmount: solUsed,
-      rangePercent: preset.range,
-      strategy: preset.strategy,
-      addedAt: new Date().toISOString(),
-      txHash: result.signature,
-      walletId: this.wallets.activeMeta?.id ?? '',
-      synced: false,
+    const track = (positionKey: string, txHash: string): void => {
+      this.positions.upsert({
+        positionKey,
+        poolAddress,
+        minBinId,
+        maxBinId,
+        solAmount: solUsed,
+        rangePercent: preset.range,
+        strategy: preset.strategy,
+        addedAt: new Date().toISOString(),
+        txHash,
+        walletId: this.wallets.activeMeta?.id ?? '',
+        synced: false,
+      });
     };
-    this.positions.upsert(tracked);
+
+    let result;
+    try {
+      result = await this.dlmm.openPosition({
+        poolAddress,
+        owner,
+        solAmount: solUsed,
+        minBinId,
+        maxBinId,
+        strategy: preset.strategy,
+        signal,
+      });
+    } catch (e) {
+      // A wide range lands across many transactions. If it failed partway, the
+      // position EXISTS and HOLDS FUNDS. Record it before rethrowing, or the bot
+      // would forget about real money sitting on-chain and the user would have
+      // no way to remove it from the UI.
+      const err = classify(e);
+      const partialKey = err.context.positionKey;
+      if (err.code === 'position.partiallyFunded' && typeof partialKey === 'string') {
+        track(partialKey, 'partial');
+        this.log.error('recorded partially funded position so it is not lost', {
+          position: partialKey,
+          pool: poolAddress,
+        });
+      }
+      throw err;
+    }
+
+    track(result.positionKey, result.signature);
 
     this.log.info('liquidity added', {
       pool: poolAddress,
